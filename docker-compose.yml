@@ -1,16 +1,20 @@
 services:
-  gws_mcp:
+  google-mcp:
     build: .
-    container_name: gws_mcp
+    container_name: google-mcp
+    restart: unless-stopped
+    volumes:
+      - google-mcp-creds:/app/store_creds
+    environment:
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+      - WORKSPACE_MCP_CREDENTIALS_DIR=/app/store_creds
+      - MCP_SINGLE_USER_MODE=1
+      - USER_GOOGLE_EMAIL=${USER_GOOGLE_EMAIL}
+      - PORT=8000
+      - TOOLS=gmail calendar drive
     ports:
       - "8000:8000"
-    environment:
-      - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
-    volumes:
-      - ./client_secret.json:/app/client_secret.json:ro
-      - store_creds:/app/store_creds:rw
-    env_file:
-      - .env
 
 volumes:
-  store_creds:
+  google-mcp-creds:

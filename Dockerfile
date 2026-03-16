@@ -5,6 +5,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
+    dumb-init \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for faster dependency management
@@ -13,7 +14,7 @@ RUN pip install --no-cache-dir uv
 COPY . .
 
 # Install Python dependencies using uv sync
-RUN uv sync --frozen --no-dev --extra disk
+RUN uv sync --frozen --no-dev
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \
@@ -41,5 +42,5 @@ ENV TOOL_TIER=""
 ENV TOOLS=""
 
 # Use entrypoint for the base command and CMD for args
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["/bin/sh", "-c", "uv run main.py --transport streamable-http ${TOOL_TIER:+--tool-tier \"$TOOL_TIER\"} ${TOOLS:+--tools $TOOLS}"]
