@@ -335,6 +335,75 @@ async def list_calendars(service, user_google_email: str) -> str:
     return text_output
 
 
+async def _fetch_event_items(
+    service,
+    calendar_id: str = "primary",
+    event_id: Optional[str] = None,
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    max_results: int = 25,
+    query: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Returns raw Google Calendar API event items.
+
+    In single-event mode (``event_id`` provided), returns a single-element
+    list from ``service.events().get(...)``. Otherwise calls
+    ``service.events().list(...)`` with the time-format prep,
+    ``singleEvents=True`` and ``orderBy="startTime"`` behavior preserved.
+    """
+    if event_id:
+        logger.info(f"[_fetch_event_items] Retrieving single event with ID: {event_id}")
+        event = await asyncio.to_thread(
+            lambda: (
+                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+            )
+        )
+        return [event]
+
+    # Ensure time_min and time_max are correctly formatted for the API
+    formatted_time_min = _correct_time_format_for_api(time_min, "time_min")
+    if formatted_time_min:
+        effective_time_min = formatted_time_min
+    else:
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        effective_time_min = utc_now.isoformat().replace("+00:00", "Z")
+    if time_min is None:
+        logger.info(
+            f"time_min not provided, defaulting to current UTC time: {effective_time_min}"
+        )
+    else:
+        logger.info(
+            f"time_min processing: original='{time_min}', formatted='{formatted_time_min}', effective='{effective_time_min}'"
+        )
+
+    effective_time_max = _correct_time_format_for_api(time_max, "time_max")
+    if time_max:
+        logger.info(
+            f"time_max processing: original='{time_max}', formatted='{effective_time_max}'"
+        )
+
+    logger.info(
+        f"[_fetch_event_items] Final API parameters - calendarId: '{calendar_id}', timeMin: '{effective_time_min}', timeMax: '{effective_time_max}', maxResults: {max_results}, query: '{query}'"
+    )
+
+    request_params = {
+        "calendarId": calendar_id,
+        "timeMin": effective_time_min,
+        "timeMax": effective_time_max,
+        "maxResults": max_results,
+        "singleEvents": True,
+        "orderBy": "startTime",
+    }
+
+    if query:
+        request_params["q"] = query
+
+    events_result = await asyncio.to_thread(
+        lambda: service.events().list(**request_params).execute()
+    )
+    return events_result.get("items", [])
+
+
 @server.tool()
 @handle_http_errors("get_events", is_read_only=True, service_type="calendar")
 @require_google_service("calendar", "calendar_read")
@@ -372,60 +441,15 @@ async def get_events(
         f"[get_events] Raw parameters - event_id: '{event_id}', time_min: '{time_min}', time_max: '{time_max}', query: '{query}', detailed: {detailed}, include_attachments: {include_attachments}"
     )
 
-    # Handle single event retrieval
-    if event_id:
-        logger.info(f"[get_events] Retrieving single event with ID: {event_id}")
-        event = await asyncio.to_thread(
-            lambda: (
-                service.events().get(calendarId=calendar_id, eventId=event_id).execute()
-            )
-        )
-        items = [event]
-    else:
-        # Handle multiple events retrieval with time filtering
-        # Ensure time_min and time_max are correctly formatted for the API
-        formatted_time_min = _correct_time_format_for_api(time_min, "time_min")
-        if formatted_time_min:
-            effective_time_min = formatted_time_min
-        else:
-            utc_now = datetime.datetime.now(datetime.timezone.utc)
-            effective_time_min = utc_now.isoformat().replace("+00:00", "Z")
-        if time_min is None:
-            logger.info(
-                f"time_min not provided, defaulting to current UTC time: {effective_time_min}"
-            )
-        else:
-            logger.info(
-                f"time_min processing: original='{time_min}', formatted='{formatted_time_min}', effective='{effective_time_min}'"
-            )
-
-        effective_time_max = _correct_time_format_for_api(time_max, "time_max")
-        if time_max:
-            logger.info(
-                f"time_max processing: original='{time_max}', formatted='{effective_time_max}'"
-            )
-
-        logger.info(
-            f"[get_events] Final API parameters - calendarId: '{calendar_id}', timeMin: '{effective_time_min}', timeMax: '{effective_time_max}', maxResults: {max_results}, query: '{query}'"
-        )
-
-        # Build the request parameters dynamically
-        request_params = {
-            "calendarId": calendar_id,
-            "timeMin": effective_time_min,
-            "timeMax": effective_time_max,
-            "maxResults": max_results,
-            "singleEvents": True,
-            "orderBy": "startTime",
-        }
-
-        if query:
-            request_params["q"] = query
-
-        events_result = await asyncio.to_thread(
-            lambda: service.events().list(**request_params).execute()
-        )
-        items = events_result.get("items", [])
+    items = await _fetch_event_items(
+        service,
+        calendar_id=calendar_id,
+        event_id=event_id,
+        time_min=time_min,
+        time_max=time_max,
+        max_results=max_results,
+        query=query,
+    )
     if not items:
         if event_id:
             return f"Event with ID '{event_id}' not found in calendar '{calendar_id}' for {user_google_email}."
@@ -532,6 +556,59 @@ async def get_events(
 
     logger.info(f"Successfully retrieved {len(items)} events for {user_google_email}.")
     return text_output
+
+
+@server.tool()
+@handle_http_errors("get_events_raw", is_read_only=True, service_type="calendar")
+@require_google_service("calendar", "calendar_read")
+async def get_events_raw(
+    service,
+    user_google_email: str,
+    calendar_id: str = "primary",
+    event_id: Optional[str] = None,
+    time_min: Optional[str] = None,
+    time_max: Optional[str] = None,
+    max_results: int = 250,
+    query: Optional[str] = None,
+) -> str:
+    """
+    Returns raw JSON of events from Google Calendar API v3.
+
+    Unlike get_events (which formats for agent consumption), this returns
+    the full event resource per the Google Calendar API v3 spec - including
+    id, created, organizer (with email + displayName), attendees with
+    responseStatus / displayName / organizer / optional / self flags,
+    start.dateTime or start.date, recurringEventId, eventType, etag.
+
+    Designed for programmatic callers (audit jobs, sync workers) that need
+    structured access rather than formatted text.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        calendar_id (str): The ID of the calendar to query. Use 'primary' for the user's primary calendar. Defaults to 'primary'.
+        event_id (Optional[str]): The ID of a specific event to retrieve. If provided, retrieves only this event and ignores time filtering parameters.
+        time_min (Optional[str]): The start of the time range (inclusive) in RFC3339 format. If omitted, defaults to the current time. Ignored if event_id is provided.
+        time_max (Optional[str]): The end of the time range (exclusive) in RFC3339 format. Ignored if event_id is provided.
+        max_results (int): The maximum number of events to return. Defaults to 250. Ignored if event_id is provided.
+        query (Optional[str]): A keyword to search for within event fields. Ignored if event_id is provided.
+
+    Returns:
+        str: ``json.dumps({"events": [...]}, default=str)`` - a list of raw
+        Google Calendar API event resources.
+    """
+    items = await _fetch_event_items(
+        service,
+        calendar_id=calendar_id,
+        event_id=event_id,
+        time_min=time_min,
+        time_max=time_max,
+        max_results=max_results,
+        query=query,
+    )
+    logger.info(
+        f"[get_events_raw] Returning {len(items)} raw event(s) for {user_google_email}."
+    )
+    return json.dumps({"events": items}, default=str)
 
 
 # ---------------------------------------------------------------------------
