@@ -16,7 +16,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors
+from core.utils import handle_http_errors, UserInputError
 
 from core.server import server
 
@@ -1278,6 +1278,135 @@ async def manage_event(
         raise ValueError(
             f"Invalid action '{action_lower}'. Must be 'create', 'update', or 'delete'."
         )
+
+
+# ---------------------------------------------------------------------------
+# Invitation response tool
+# ---------------------------------------------------------------------------
+
+# Ergonomic aliases -> canonical Google responseStatus values, so an LLM caller
+# can say "accept" / "decline" / "tentative" naturally.
+_RESPONSE_STATUS_MAP = {
+    "accept": "accepted",
+    "accepted": "accepted",
+    "decline": "declined",
+    "declined": "declined",
+    "tentative": "tentative",
+    "tentatively": "tentative",
+    "tentativelyaccept": "tentative",
+}
+
+_VALID_SEND_UPDATES = {"all", "externalOnly", "none"}
+
+
+@server.tool()
+@handle_http_errors("respond_event", service_type="calendar")
+@require_google_service("calendar", "calendar_events")
+async def respond_event(
+    service,
+    user_google_email: str,
+    event_id: str,
+    response_status: str,
+    calendar_id: str = "primary",
+    send_updates: str = "all",
+) -> str:
+    """
+    Respond to a calendar event invitation by setting your own attendee responseStatus (accept/decline/tentative). Works for events you do not organize.
+
+    Changes ONLY the caller's own attendee response. All other attendees and
+    every shared event property (start, end, summary, etc.) are left untouched.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        event_id (str): The ID of the event to respond to. Required.
+        response_status (str): Your response. Accepts "accept"/"accepted",
+            "decline"/"declined", or "tentative". Required.
+        calendar_id (str): Calendar ID (default: 'primary').
+        send_updates (str): Whether to notify attendees - "all" (default),
+            "externalOnly", or "none".
+
+    Returns:
+        str: Confirmation message with event details.
+    """
+    # Validate inputs BEFORE any API call so bad input never hits Google.
+    normalized = response_status.lower().strip()
+    mapped_status = _RESPONSE_STATUS_MAP.get(normalized)
+    if mapped_status is None:
+        raise UserInputError(
+            f"Invalid response_status '{response_status}'. Must be one of: "
+            "accept/accepted, decline/declined, tentative."
+        )
+
+    if send_updates not in _VALID_SEND_UPDATES:
+        raise UserInputError(
+            f"Invalid send_updates '{send_updates}'. Must be one of: "
+            f"{', '.join(sorted(_VALID_SEND_UPDATES))}."
+        )
+
+    logger.info(
+        f"[respond_event] Responding '{mapped_status}' to event '{event_id}' "
+        f"in calendar '{calendar_id}' for {user_google_email}"
+    )
+
+    # GET the existing event so we can preserve the full attendees list.
+    existing_event = await asyncio.to_thread(
+        lambda: service.events().get(calendarId=calendar_id, eventId=event_id).execute()
+    )
+
+    attendees = existing_event.get("attendees") or []
+
+    # Find the caller's own attendee entry. Two-pass with the API-provided
+    # `self` flag taking precedence over an email match, so an email-matching
+    # alias entry appearing before the authoritative self entry can't shadow it.
+    # The user_google_email injected by the decorators IS the caller's own email.
+    self_email = user_google_email.lower()
+    own_entry = next((a for a in attendees if a.get("self") is True), None)
+    if own_entry is None:
+        own_entry = next(
+            (a for a in attendees if a.get("email", "").lower() == self_email),
+            None,
+        )
+
+    if own_entry is None:
+        raise UserInputError(
+            f"{user_google_email} is not an attendee of event '{event_id}'; "
+            "cannot set a response status."
+        )
+
+    # Mutate ONLY the caller's responseStatus, leaving every other field and
+    # every other attendee untouched.
+    own_entry["responseStatus"] = mapped_status
+
+    # attendees array is overwritten wholesale by patch (not merged); send full
+    # list to preserve other attendees.
+    # https://developers.google.com/workspace/calendar/api/v3/reference/events/patch
+    patched_event = await asyncio.to_thread(
+        lambda: (
+            service.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body={"attendees": attendees},
+                sendUpdates=send_updates,
+            )
+            .execute()
+        )
+    )
+
+    summary = patched_event.get("summary", existing_event.get("summary", "(no title)"))
+    link = patched_event.get("htmlLink")
+    confirmation_message = (
+        f"Successfully set your response to '{mapped_status}' for event "
+        f"'{summary}' (ID: {event_id}) for {user_google_email}."
+    )
+    if link:
+        confirmation_message += f" Link: {link}"
+
+    logger.info(
+        f"[respond_event] Response '{mapped_status}' set successfully for "
+        f"{user_google_email}. ID: {patched_event.get('id', event_id)}"
+    )
+    return confirmation_message
 
 
 # ---------------------------------------------------------------------------

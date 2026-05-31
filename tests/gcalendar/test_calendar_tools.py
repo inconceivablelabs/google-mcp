@@ -15,7 +15,13 @@ from unittest.mock import Mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from gcalendar.calendar_tools import _fetch_event_items, get_events, get_events_raw
+from gcalendar.calendar_tools import (
+    _fetch_event_items,
+    get_events,
+    get_events_raw,
+    respond_event,
+)
+from core.utils import UserInputError
 
 
 def _unwrap(tool):
@@ -365,3 +371,274 @@ async def test_get_events_formatted_output_single_event_basic():
     assert "Successfully retrieved event" in result
     assert "1:1 with Alex" in result
     assert "evt_one_attendee" in result
+
+
+# ---------------------------------------------------------------------------
+# respond_event tests (gmc-0i8)
+# ---------------------------------------------------------------------------
+
+
+def _three_attendee_event() -> dict:
+    """Event where the user is one of three attendees and has not yet responded."""
+    return {
+        "kind": "calendar#event",
+        "id": "evt_three",
+        "summary": "Team Sync",
+        "htmlLink": "https://calendar.google.com/event?eid=evt_three",
+        "attendees": [
+            {
+                "email": "user@example.com",
+                "responseStatus": "needsAction",
+                "self": True,
+            },
+            {"email": "alex@example.com", "responseStatus": "accepted"},
+            {"email": "casey@example.com", "responseStatus": "declined"},
+        ],
+    }
+
+
+def _patched_event_return() -> dict:
+    return {
+        "kind": "calendar#event",
+        "id": "evt_three",
+        "summary": "Team Sync",
+        "htmlLink": "https://calendar.google.com/event?eid=evt_three",
+    }
+
+
+@pytest.mark.asyncio
+async def test_respond_event_accept_preserves_other_attendees_via_patch():
+    """Accepting an invite patches the full attendee list, changing only self's responseStatus."""
+    event = _three_attendee_event()
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+    # Configure patch's return WITHOUT calling patch() (so call_count stays accurate).
+    mock_service.events.return_value.patch.return_value.execute.return_value = (
+        _patched_event_return()
+    )
+
+    result = await _unwrap(respond_event)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        event_id="evt_three",
+        response_status="accepted",
+    )
+
+    # (a) patch called exactly once; update never called.
+    assert mock_service.events.return_value.patch.call_count == 1
+    assert not mock_service.events.return_value.update.called
+
+    patch_kwargs = mock_service.events.return_value.patch.call_args.kwargs
+    body = patch_kwargs["body"]
+    attendees = body["attendees"]
+
+    # (b) all 3 entries present; only self changed.
+    assert len(attendees) == 3
+    by_email = {a["email"]: a for a in attendees}
+    assert by_email["user@example.com"]["responseStatus"] == "accepted"
+    assert by_email["alex@example.com"] == {
+        "email": "alex@example.com",
+        "responseStatus": "accepted",
+    }
+    assert by_email["casey@example.com"] == {
+        "email": "casey@example.com",
+        "responseStatus": "declined",
+    }
+    # self entry keeps its other fields (self flag) untouched.
+    assert by_email["user@example.com"]["self"] is True
+
+    # (c) patch kwargs include calendarId, eventId, sendUpdates.
+    assert patch_kwargs["calendarId"] == "primary"
+    assert patch_kwargs["eventId"] == "evt_three"
+    assert patch_kwargs["sendUpdates"] == "all"
+
+    # (d) body contains ONLY the attendees key (no shared/organizer-owned keys).
+    assert set(body.keys()) == {"attendees"}
+
+    assert "Team Sync" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        ("accept", "accepted"),
+        ("decline", "declined"),
+        ("tentative", "tentative"),
+        ("accepted", "accepted"),
+    ],
+)
+async def test_respond_event_status_aliases_map_correctly(given, expected):
+    """Ergonomic aliases map to the correct Google responseStatus value."""
+    event = _three_attendee_event()
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+    mock_service.events.return_value.patch.return_value.execute.return_value = (
+        _patched_event_return()
+    )
+
+    await _unwrap(respond_event)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        event_id="evt_three",
+        response_status=given,
+    )
+
+    body = mock_service.events.return_value.patch.call_args.kwargs["body"]
+    by_email = {a["email"]: a for a in body["attendees"]}
+    assert by_email["user@example.com"]["responseStatus"] == expected
+
+
+@pytest.mark.asyncio
+async def test_respond_event_self_matched_by_self_flag():
+    """Self entry is matched via self:True even when the email differs/case-mismatches."""
+    event = {
+        "id": "evt_self_flag",
+        "summary": "Offsite",
+        "attendees": [
+            {
+                "email": "OTHER-ALIAS@example.com",
+                "responseStatus": "needsAction",
+                "self": True,
+            },
+            {"email": "alex@example.com", "responseStatus": "accepted"},
+        ],
+    }
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+    mock_service.events.return_value.patch.return_value.execute.return_value = {
+        "summary": "Offsite",
+        "id": "evt_self_flag",
+    }
+
+    await _unwrap(respond_event)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        event_id="evt_self_flag",
+        response_status="tentative",
+    )
+
+    body = mock_service.events.return_value.patch.call_args.kwargs["body"]
+    by_email = {a["email"]: a for a in body["attendees"]}
+    assert by_email["OTHER-ALIAS@example.com"]["responseStatus"] == "tentative"
+    # other attendee untouched
+    assert by_email["alex@example.com"]["responseStatus"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_respond_event_user_not_attendee_raises():
+    """If the user is not among attendees (and no self:true), raise UserInputError and don't patch."""
+    event = {
+        "id": "evt_no_self",
+        "summary": "Not Invited",
+        "attendees": [
+            {"email": "alex@example.com", "responseStatus": "accepted"},
+            {"email": "casey@example.com", "responseStatus": "declined"},
+        ],
+    }
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+
+    with pytest.raises(UserInputError):
+        await _unwrap(respond_event)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            event_id="evt_no_self",
+            response_status="accepted",
+        )
+
+    assert not mock_service.events.return_value.patch.called
+
+
+@pytest.mark.asyncio
+async def test_respond_event_invalid_response_status_raises():
+    """An unrecognized response_status raises UserInputError before any API call."""
+    mock_service = Mock()
+
+    with pytest.raises(UserInputError):
+        await _unwrap(respond_event)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            event_id="evt_three",
+            response_status="maybe",
+        )
+
+    assert not mock_service.events.return_value.get.called
+    assert not mock_service.events.return_value.patch.called
+
+
+@pytest.mark.asyncio
+async def test_respond_event_invalid_send_updates_raises():
+    """An invalid send_updates value raises UserInputError."""
+    mock_service = Mock()
+
+    with pytest.raises(UserInputError):
+        await _unwrap(respond_event)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            event_id="evt_three",
+            response_status="accepted",
+            send_updates="bogus",
+        )
+
+    assert not mock_service.events.return_value.patch.called
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attendees_value", [None, []])
+async def test_respond_event_no_attendees_raises(attendees_value):
+    """An event with no/empty attendees raises UserInputError and never patches."""
+    event = {"id": "evt_empty", "summary": "Solo Block"}
+    if attendees_value is not None:
+        event["attendees"] = attendees_value
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+
+    with pytest.raises(UserInputError):
+        await _unwrap(respond_event)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            event_id="evt_empty",
+            response_status="accepted",
+        )
+
+    assert not mock_service.events.return_value.patch.called
+
+
+@pytest.mark.asyncio
+async def test_respond_event_self_flag_takes_precedence_over_email_match():
+    """When an email-matching entry precedes the self:true entry, the self entry wins."""
+    event = {
+        "id": "evt_precedence",
+        "summary": "Precedence Check",
+        "attendees": [
+            # Email-matching alias entry appears FIRST, but has no self flag.
+            {"email": "user@example.com", "responseStatus": "needsAction"},
+            # Authoritative self entry has a different email.
+            {
+                "email": "primary-alias@example.com",
+                "responseStatus": "needsAction",
+                "self": True,
+            },
+        ],
+    }
+    mock_service = Mock()
+    mock_service.events().get().execute.return_value = event
+    mock_service.events.return_value.patch.return_value.execute.return_value = {
+        "summary": "Precedence Check",
+        "id": "evt_precedence",
+    }
+
+    await _unwrap(respond_event)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        event_id="evt_precedence",
+        response_status="accepted",
+    )
+
+    body = mock_service.events.return_value.patch.call_args.kwargs["body"]
+    by_email = {a["email"]: a for a in body["attendees"]}
+    # The self:true entry is the one that changed.
+    assert by_email["primary-alias@example.com"]["responseStatus"] == "accepted"
+    # The email-only entry is left unchanged.
+    assert by_email["user@example.com"]["responseStatus"] == "needsAction"
